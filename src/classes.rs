@@ -1,5 +1,66 @@
 use core::fmt;
 
+#[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Byte {
+    U8(u8),
+    EOF(u16),
+}
+
+impl Byte {
+    pub fn as_u8(self) -> Option<u8> {
+        match self {
+            Byte::U8(b) => Some(b),
+            Byte::EOF(_) => None,
+        }
+    }
+
+    pub fn as_eof(self) -> Option<usize> {
+        match self {
+            Byte::U8(_) => None,
+            Byte::EOF(eof) => Some(eof as usize),
+        }
+    }
+
+    pub fn as_usize(self) -> usize {
+        match self {
+            Byte::U8(b) => b as usize,
+            Byte::EOF(eof) => eof as usize,
+        }
+    }
+
+    pub fn is_eof(&self) -> bool {
+        match *self {
+            Byte::EOF(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_word_byte(&self) -> bool {
+        self.as_u8().map_or(false, crate::word::is_word_byte)
+    }
+
+    pub fn escape(&self) -> String {
+        use std::ascii;
+
+        match *self {
+            Byte::U8(b) => {
+                String::from_utf8(ascii::escape_default(b).collect::<Vec<_>>())
+                    .unwrap()
+            }
+            Byte::EOF(_) => "EOF".to_string(),
+        }
+    }
+}
+
+impl fmt::Debug for Byte {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Byte::U8(b) => write!(f, r"\x{:02x}", b),
+            Byte::EOF(_) => write!(f, "EOF"),
+        }
+    }
+}
+
 /// A representation of byte oriented equivalence classes.
 ///
 /// This is used in a DFA to reduce the size of the transition table. This can
@@ -61,12 +122,27 @@ impl ByteClasses {
         *self.0.get_unchecked(byte as usize)
     }
 
+    #[inline]
+    pub fn eof(&self) -> Byte {
+        Byte::EOF(self.alphabet_len() as u16 - 1)
+    }
+
+    #[inline]
+    pub fn usize_to_byte(&self, b: usize) -> Byte {
+        if b == self.alphabet_len() - 1 {
+            self.eof()
+        } else {
+            assert!(b <= 255);
+            Byte::U8(b as u8)
+        }
+    }
+
     /// Return the total number of elements in the alphabet represented by
     /// these equivalence classes. Equivalently, this returns the total number
     /// of equivalence classes.
     #[inline]
     pub fn alphabet_len(&self) -> usize {
-        self.0[255] as usize + 1
+        self.0[255] as usize + 1 + 1
     }
 
     /// Returns true if and only if every byte in this class maps to its own
@@ -74,7 +150,13 @@ impl ByteClasses {
     /// and each class contains exactly one byte.
     #[inline]
     pub fn is_singleton(&self) -> bool {
-        self.alphabet_len() == 256
+        self.alphabet_len() == 257
+    }
+
+    /// Returns an iterator over all equivalence classes in this set.
+    #[cfg(feature = "std")]
+    pub fn iter(&self) -> ByteClassIter<'_> {
+        ByteClassIter { classes: self, i: 0 }
     }
 
     /// Returns an iterator over a sequence of representative bytes from each
@@ -122,6 +204,33 @@ impl fmt::Debug for ByteClasses {
     }
 }
 
+/// An iterator over each equivalence class.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct ByteClassIter<'a> {
+    classes: &'a ByteClasses,
+    i: usize,
+}
+
+#[cfg(feature = "std")]
+impl<'a> Iterator for ByteClassIter<'a> {
+    type Item = Byte;
+
+    fn next(&mut self) -> Option<Byte> {
+        if self.i + 1 == self.classes.alphabet_len() {
+            let class = self.i as u16;
+            self.i += 1;
+            Some(Byte::EOF(class))
+        } else if self.i < self.classes.alphabet_len() {
+            let class = self.i as u8;
+            self.i += 1;
+            Some(Byte::U8(class))
+        } else {
+            None
+        }
+    }
+}
+
 /// An iterator over representative bytes from each equivalence class.
 #[cfg(feature = "std")]
 #[derive(Debug)]
@@ -133,9 +242,9 @@ pub struct ByteClassRepresentatives<'a> {
 
 #[cfg(feature = "std")]
 impl<'a> Iterator for ByteClassRepresentatives<'a> {
-    type Item = u8;
+    type Item = Byte;
 
-    fn next(&mut self) -> Option<u8> {
+    fn next(&mut self) -> Option<Byte> {
         while self.byte < 256 {
             let byte = self.byte as u8;
             let class = self.classes.get(byte);
@@ -143,8 +252,12 @@ impl<'a> Iterator for ByteClassRepresentatives<'a> {
 
             if self.last_class != Some(class) {
                 self.last_class = Some(class);
-                return Some(byte);
+                return Some(Byte::U8(byte));
             }
+        }
+        if self.byte == 256 {
+            self.byte += 1;
+            return Some(self.classes.eof());
         }
         None
     }
@@ -178,15 +291,21 @@ impl<'a> Iterator for ByteClassRepresentatives<'a> {
 /// be in the same equivalence class, which means that we can never discover
 /// the true minimal set of equivalence classes.
 #[cfg(feature = "std")]
-#[derive(Debug)]
-pub struct ByteClassSet(Vec<bool>);
+#[derive(Clone, Debug)]
+pub struct ByteClassSet(ByteSet);
 
 #[cfg(feature = "std")]
 impl ByteClassSet {
     /// Create a new set of byte classes where all bytes are part of the same
     /// equivalence class.
     pub fn new() -> Self {
-        ByteClassSet(vec![false; 256])
+        ByteClassSet(ByteSet::empty())
+    }
+
+    /// Create a new set of byte classes where all bytes are part of the same
+    /// equivalence class.
+    pub fn empty() -> Self {
+        ByteClassSet(ByteSet::empty())
     }
 
     /// Indicate the the range of byte given (inclusive) can discriminate a
@@ -194,9 +313,16 @@ impl ByteClassSet {
     pub fn set_range(&mut self, start: u8, end: u8) {
         debug_assert!(start <= end);
         if start > 0 {
-            self.0[start as usize - 1] = true;
+            self.0.add(start - 1);
         }
-        self.0[end as usize] = true;
+        self.0.add(end);
+    }
+
+    /// Add the contiguous ranges in the set given to this byte class set.
+    pub fn add_set(&mut self, set: &ByteSet) {
+        for (start, end) in set.iter_ranges() {
+            self.set_range(start, end);
+        }
     }
 
     /// Convert this boolean set to a map that maps all byte values to their
@@ -205,18 +331,162 @@ impl ByteClassSet {
     pub fn byte_classes(&self) -> ByteClasses {
         let mut classes = ByteClasses::empty();
         let mut class = 0u8;
-        let mut i = 0;
+        let mut b = 0u8;
         loop {
-            classes.set(i as u8, class as u8);
-            if i >= 255 {
+            classes.set(b, class);
+            if b == 255 {
                 break;
             }
-            if self.0[i] {
+            if self.0.contains(b) {
                 class = class.checked_add(1).unwrap();
             }
-            i += 1;
+            b = b.checked_add(1).unwrap();
         }
         classes
+    }
+}
+
+/// A simple set of bytes that is reasonably cheap to copy and allocation free.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ByteSet {
+    bits: BitSet,
+}
+
+/// The representation of a byte set. Split out so that we can define a
+/// convenient Debug impl for it while keeping "ByteSet" in the output.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct BitSet([u128; 2]);
+
+impl ByteSet {
+    /// Create an empty set of bytes.
+    pub fn empty() -> ByteSet {
+        ByteSet { bits: BitSet([0; 2]) }
+    }
+
+    /// Add a byte to this set.
+    ///
+    /// If the given byte already belongs to this set, then this is a no-op.
+    pub fn add(&mut self, byte: u8) {
+        let bucket = byte / 128;
+        let bit = byte % 128;
+        self.bits.0[bucket as usize] |= 1 << bit;
+    }
+
+    /// Add an inclusive range of bytes.
+    pub fn add_all(&mut self, start: u8, end: u8) {
+        for b in start..=end {
+            self.add(b);
+        }
+    }
+
+    /// Remove a byte from this set.
+    ///
+    /// If the given byte is not in this set, then this is a no-op.
+    pub fn remove(&mut self, byte: u8) {
+        let bucket = byte / 128;
+        let bit = byte % 128;
+        self.bits.0[bucket as usize] &= !(1 << bit);
+    }
+
+    /// Remove an inclusive range of bytes.
+    pub fn remove_all(&mut self, start: u8, end: u8) {
+        for b in start..=end {
+            self.remove(b);
+        }
+    }
+
+    /// Return true if and only if the given byte is in this set.
+    pub fn contains(&self, byte: u8) -> bool {
+        let bucket = byte / 128;
+        let bit = byte % 128;
+        self.bits.0[bucket as usize] & (1 << bit) > 0
+    }
+
+    /// Return true if and only if the given inclusive range of bytes is in
+    /// this set.
+    pub fn contains_range(&self, start: u8, end: u8) -> bool {
+        (start..=end).all(|b| self.contains(b))
+    }
+
+    /// Returns an iterator over all bytes in this set.
+    pub fn iter(&self) -> ByteSetIter {
+        ByteSetIter { set: self, b: 0 }
+    }
+
+    /// Returns an iterator over all contiguous ranges of bytes in this set.
+    pub fn iter_ranges(&self) -> ByteSetRangeIter {
+        ByteSetRangeIter { set: self, b: 0 }
+    }
+
+    /// Return the number of bytes in this set.
+    pub fn len(&self) -> usize {
+        (self.bits.0[0].count_ones() + self.bits.0[1].count_ones()) as usize
+    }
+
+    /// Return true if and only if this set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bits.0 == [0, 0]
+    }
+}
+
+impl core::fmt::Debug for BitSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let mut fmtd = f.debug_set();
+        for b in (0..256).map(|b| b as u8) {
+            if (ByteSet { bits: *self }).contains(b) {
+                fmtd.entry(&b);
+            }
+        }
+        fmtd.finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct ByteSetIter<'a> {
+    set: &'a ByteSet,
+    b: usize,
+}
+
+impl<'a> Iterator for ByteSetIter<'a> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        while self.b <= 255 {
+            let b = self.b as u8;
+            self.b += 1;
+            if self.set.contains(b) {
+                return Some(b);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct ByteSetRangeIter<'a> {
+    set: &'a ByteSet,
+    b: usize,
+}
+
+impl<'a> Iterator for ByteSetRangeIter<'a> {
+    type Item = (u8, u8);
+
+    fn next(&mut self) -> Option<(u8, u8)> {
+        while self.b <= 255 {
+            let start = self.b as u8;
+            self.b += 1;
+            if !self.set.contains(start) {
+                continue;
+            }
+
+            let mut end = start;
+            while self.b <= 255 && self.set.contains(self.b as u8) {
+                end = self.b as u8;
+                self.b += 1;
+            }
+            return Some((start, end));
+        }
+        None
     }
 }
 
@@ -266,6 +536,6 @@ mod tests {
         for i in 0..256u16 {
             set.set_range(i as u8, i as u8);
         }
-        assert_eq!(set.byte_classes().alphabet_len(), 256);
+        assert_eq!(set.byte_classes().alphabet_len(), 257);
     }
 }

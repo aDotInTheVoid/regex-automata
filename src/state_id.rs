@@ -11,52 +11,8 @@ pub use self::std::*;
 mod std {
     use byteorder::ByteOrder;
     use core::mem::size_of;
-    use crate::error::{Error, Result};
 
     use super::StateID;
-
-    /// Check that the premultiplication of the given state identifier can
-    /// fit into the representation indicated by `S`. If it cannot, or if it
-    /// overflows `usize` itself, then an error is returned.
-    pub fn premultiply_overflow_error<S: StateID>(
-        last_state: S,
-        alphabet_len: usize,
-    ) -> Result<()> {
-        let requested = match last_state.to_usize().checked_mul(alphabet_len) {
-            Some(requested) => requested,
-            None => return Err(Error::premultiply_overflow(0, 0)),
-        };
-        if requested > S::max_id() {
-            return Err(Error::premultiply_overflow(S::max_id(), requested));
-        }
-        Ok(())
-    }
-
-    /// Allocate the next sequential identifier for a fresh state given
-    /// the previously constructed state identified by `current`. If the
-    /// next sequential identifier would overflow `usize` or the chosen
-    /// representation indicated by `S`, then an error is returned.
-    pub fn next_state_id<S: StateID>(current: S) -> Result<S> {
-        let next = match current.to_usize().checked_add(1) {
-            Some(next) => next,
-            None => return Err(Error::state_id_overflow(::std::usize::MAX)),
-        };
-        if next > S::max_id() {
-            return Err(Error::state_id_overflow(S::max_id()));
-        }
-        Ok(S::from_usize(next))
-    }
-
-    /// Convert the given `usize` to the chosen state identifier
-    /// representation. If the given value cannot fit in the chosen
-    /// representation, then an error is returned.
-    pub fn usize_to_state_id<S: StateID>(value: usize) -> Result<S> {
-        if value > S::max_id() {
-            Err(Error::state_id_overflow(S::max_id()))
-        } else {
-            Ok(S::from_usize(value))
-        }
-    }
 
     /// Write the given identifier to the given slice of bytes using the
     /// specified endianness. The given slice must have length at least
@@ -73,12 +29,13 @@ mod std {
                 || 4 == size_of::<S>()
                 || 8 == size_of::<S>()
         );
+        id.write_bytes(slice);
 
         match size_of::<S>() {
-            1 => slice[0] = id.to_usize() as u8,
-            2 => E::write_u16(slice, id.to_usize() as u16),
-            4 => E::write_u32(slice, id.to_usize() as u32),
-            8 => E::write_u64(slice, id.to_usize() as u64),
+            1 => slice[0] = id.as_usize() as u8,
+            2 => E::write_u16(slice, id.as_usize() as u16),
+            4 => E::write_u32(slice, id.as_usize() as u32),
+            8 => E::write_u64(slice, id.as_usize() as u64),
             _ => unreachable!(),
         }
     }
@@ -130,7 +87,7 @@ pub unsafe trait StateID:
     /// way for implementors to achieve this is to simply not provide
     /// implementations of `StateID` that cannot fit into the target platform's
     /// `usize`.
-    fn to_usize(self) -> usize;
+    fn as_usize(self) -> usize;
 
     /// Return the maximum state identifier supported by this representation.
     ///
@@ -160,7 +117,7 @@ unsafe impl StateID for usize {
     }
 
     #[inline]
-    fn to_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         self
     }
 
@@ -187,7 +144,7 @@ unsafe impl StateID for u8 {
     }
 
     #[inline]
-    fn to_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         self as usize
     }
 
@@ -214,7 +171,7 @@ unsafe impl StateID for u16 {
     }
 
     #[inline]
-    fn to_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         self as usize
     }
 
@@ -242,7 +199,7 @@ unsafe impl StateID for u32 {
     }
 
     #[inline]
-    fn to_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         self as usize
     }
 
@@ -270,7 +227,7 @@ unsafe impl StateID for u64 {
     }
 
     #[inline]
-    fn to_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         self as usize
     }
 

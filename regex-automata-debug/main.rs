@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use regex_automata::{dense, nfa, Regex, RegexBuilder, DFA};
+use regex_automata::dfa::{dense, Automaton, Regex, RegexBuilder};
+use regex_automata::nfa::thompson;
+use regex_automata::{MatchKind, SyntaxConfig};
 use regex_syntax as syntax;
 
 fn main() -> Result<()> {
@@ -42,7 +44,7 @@ impl Command {
     fn parse() -> Result<Command> {
         match app().get_matches().subcommand() {
             ("debug", Some(m)) => {
-                let args = Common::new(m);
+                let args = Common::new(m)?;
                 let pattern = pattern_from_matches(m)?;
                 let quiet = m.is_present("quiet");
                 Ok(Command {
@@ -51,7 +53,7 @@ impl Command {
                 })
             }
             ("debug-nfa", Some(m)) => {
-                let args = Common::new(m);
+                let args = Common::new(m)?;
                 let pattern = pattern_from_matches(m)?;
                 let quiet = m.is_present("quiet");
                 Ok(Command {
@@ -60,7 +62,7 @@ impl Command {
                 })
             }
             ("find", Some(m)) => {
-                let args = Common::new(m);
+                let args = Common::new(m)?;
                 let pattern = pattern_from_matches(m)?;
                 let path = PathBuf::from(m.value_of_os("path").unwrap());
                 Ok(Command { kind: CommandKind::Find { pattern, path }, args })
@@ -113,14 +115,14 @@ impl Command {
         let parse_time = Instant::now().duration_since(start);
 
         let start = Instant::now();
-        let nfa = self.nfa_builder().build(&expr)?;
+        let nfa = self.nfa_builder().build_from_hir(&expr)?;
         let nfa_time = Instant::now().duration_since(start);
 
         writeln!(stdout, "       parse time: {:?}", parse_time)?;
         writeln!(stdout, " nfa compile time: {:?}", nfa_time)?;
         if !self.quiet() {
             writeln!(stdout, "")?;
-            writeln!(stdout, "{:?}", nfa)?;
+            writeln!(stdout, "{:#?}", nfa)?;
         }
         Ok(())
     }
@@ -206,13 +208,13 @@ impl Command {
             if self.quiet() {
                 (Some(sparse), None)
             } else {
-                (Some(sparse), Some(format!("{:?}", sdfa)))
+                (Some(sparse), Some(format!("{:#?}", sdfa)))
             }
         } else {
             if self.quiet() {
                 (None, None)
             } else {
-                (None, Some(format!("{:?}", dfa)))
+                (None, Some(format!("{:#?}", dfa)))
             }
         };
 
@@ -222,39 +224,24 @@ impl Command {
     fn regex_builder(&self) -> RegexBuilder {
         let mut builder = RegexBuilder::new();
         builder
-            .anchored(self.args.anchored)
-            .case_insensitive(self.args.case_insensitive)
-            .unicode(!self.args.no_unicode)
-            .allow_invalid_utf8(self.args.no_utf8)
-            .minimize(self.args.minimize)
-            .premultiply(self.args.premultiply)
-            .byte_classes(self.args.classes);
+            .syntax(self.syntax_config())
+            .thompson(self.thompson_config())
+            .dense(self.dense_config());
         builder
     }
 
     fn dense_builder(&self) -> dense::Builder {
         let mut builder = dense::Builder::new();
         builder
-            .anchored(self.args.anchored)
-            .case_insensitive(self.args.case_insensitive)
-            .unicode(!self.args.no_unicode)
-            .allow_invalid_utf8(self.args.no_utf8)
-            .minimize(self.args.minimize)
-            .premultiply(self.args.premultiply)
-            .byte_classes(self.args.classes)
-            .reverse(self.args.reverse)
-            .longest_match(self.args.longest_match)
-            .shrink(self.args.shrink_nfa);
+            .configure(self.dense_config())
+            .syntax(self.syntax_config())
+            .thompson(self.thompson_config());
         builder
     }
 
-    fn nfa_builder(&self) -> nfa::Builder {
-        let mut builder = nfa::Builder::new();
-        builder
-            .anchored(self.args.anchored)
-            .allow_invalid_utf8(self.args.no_utf8)
-            .reverse(self.args.reverse)
-            .shrink(self.args.shrink_nfa);
+    fn nfa_builder(&self) -> thompson::Builder {
+        let mut builder = thompson::Builder::new();
+        builder.syntax(self.syntax_config()).configure(self.thompson_config());
         builder
     }
 
@@ -266,6 +253,32 @@ impl Command {
             .allow_invalid_utf8(self.args.no_utf8);
         builder
     }
+
+    fn dense_config(&self) -> dense::Config {
+        let mut config = dense::Config::new()
+            .anchored(self.args.anchored)
+            .minimize(self.args.minimize)
+            .byte_classes(self.args.classes)
+            .match_kind(self.args.kind)
+            .unicode_word_boundary(self.args.unicode_word_boundary);
+        for &b in self.args.quit.iter() {
+            config = config.quit(b, true);
+        }
+        config
+    }
+
+    fn thompson_config(&self) -> thompson::Config {
+        thompson::Config::new()
+            .reverse(self.args.reverse)
+            .shrink(self.args.shrink_nfa)
+    }
+
+    fn syntax_config(&self) -> SyntaxConfig {
+        SyntaxConfig::new()
+            .unicode(!self.args.no_unicode)
+            .case_insensitive(self.args.case_insensitive)
+            .allow_invalid_utf8(self.args.no_utf8)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -276,33 +289,54 @@ struct Common {
     no_unicode: bool,
     no_utf8: bool,
     minimize: bool,
-    premultiply: bool,
     classes: bool,
     reverse: bool,
-    longest_match: bool,
+    kind: MatchKind,
     shrink_nfa: bool,
+    unicode_word_boundary: bool,
+    quit: Vec<u8>,
 }
 
 impl Common {
-    fn new(m: &clap::ArgMatches<'_>) -> Common {
-        Common {
+    fn new(m: &clap::ArgMatches<'_>) -> Result<Common> {
+        let kind = match m.value_of_lossy("kind") {
+            None => MatchKind::LeftmostFirst,
+            Some(value) => match &*value {
+                "all" => MatchKind::All,
+                "leftmost-first" => MatchKind::LeftmostFirst,
+                unk => anyhow::bail!("unrecognized match kind: {:?}", unk),
+            },
+        };
+        let mut quit = vec![];
+        if let Some(quits) = m.value_of_lossy("quit") {
+            for ch in quits.chars() {
+                if !ch.is_ascii() {
+                    anyhow::bail!("quit bytes must be ASCII");
+                }
+                quit.push(ch as u8);
+            }
+        }
+        Ok(Common {
             sparse: m.is_present("sparse"),
             anchored: m.is_present("anchored"),
             case_insensitive: m.is_present("case-insensitive"),
             no_unicode: m.is_present("no-unicode"),
             no_utf8: m.is_present("no-utf8"),
             minimize: m.is_present("minimize"),
-            premultiply: m.is_present("premultiply"),
             classes: m.is_present("classes"),
             reverse: m.is_present("reverse"),
-            longest_match: m.is_present("longest-match"),
+            kind,
             shrink_nfa: m.is_present("shrink-nfa"),
-        }
+            unicode_word_boundary: m.is_present("unicode-word-boundary"),
+            quit,
+        })
     }
 }
 
-fn counter<D: DFA + 'static>(re: Regex<D>) -> Box<dyn Fn(&[u8]) -> usize> {
-    Box::new(move |bytes| re.find_iter(bytes).count())
+fn counter<A: Automaton + 'static>(
+    re: Regex<A>,
+) -> Box<dyn Fn(&[u8]) -> usize> {
+    Box::new(move |bytes| re.find_leftmost_iter(bytes).count())
 }
 
 fn pattern_from_matches(m: &clap::ArgMatches<'_>) -> Result<String> {
@@ -329,13 +363,19 @@ fn app() -> clap::App<'static, 'static> {
             .arg(flag("sparse").short("s"))
             .arg(flag("anchored").short("a"))
             .arg(flag("case-insensitive").short("i"))
-            .arg(flag("no-unicode"))
+            .arg(flag("no-unicode").short("U"))
             .arg(flag("no-utf8").short("u"))
+            .arg(flag("unicode-word-boundary").short("w"))
             .arg(flag("minimize").short("m"))
-            .arg(flag("premultiply").short("p"))
             .arg(flag("classes").short("c"))
             .arg(flag("reverse").short("r"))
-            .arg(flag("longest-match"))
+            .arg(flag("quit").takes_value(true))
+            .arg(
+                flag("kind")
+                    .short("k")
+                    .takes_value(true)
+                    .possible_values(&["leftmost-first", "all"]),
+            )
             .arg(flag("shrink-nfa"))
     };
 
